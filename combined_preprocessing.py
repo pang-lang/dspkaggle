@@ -18,11 +18,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from typing import Dict, List, Tuple, Optional, Union
 
-from preprocessing.image_preprocessing import (
+from image_preprocessing import (
     MedicalImagePreprocessor,
     get_or_compute_dataset_stats
 )
-from preprocessing.text_preprocessing import MedicalTextPreprocessor
+from text_preprocessing import MedicalTextPreprocessor
 import matplotlib.pyplot as plt
 from collections import Counter
 

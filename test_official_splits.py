@@ -8,7 +8,7 @@ import os
 import json
 import shutil
 from pathlib import Path
-from preprocessing.combined_preprocessing import create_combined_data_loaders
+from combined_preprocessing import create_combined_data_loaders
 
 def backup_old_splits():
     """Backup existing split files."""

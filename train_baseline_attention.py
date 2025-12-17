@@ -18,8 +18,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from models.baseline_model_attention import BaselineVQAModel, print_model_summary
-from preprocessing.combined_preprocessing import create_combined_data_loaders
+from baseline_model_attention import BaselineVQAModel, print_model_summary
+from combined_preprocessing import create_combined_data_loaders
 import numpy as np
 from tqdm import tqdm
 import logging

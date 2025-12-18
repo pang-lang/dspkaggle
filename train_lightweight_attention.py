@@ -27,8 +27,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import Counter
 
-from preprocessing.combined_preprocessing import create_combined_data_loaders
-from models.lightweight_model import LightweightVQAModel
+from combined_preprocessing import create_combined_data_loaders
+from lightweight_model import LightweightVQAModel
 
 
 class ImprovedFocalLoss(nn.Module):

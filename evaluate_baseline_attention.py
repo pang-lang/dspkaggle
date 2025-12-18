@@ -538,7 +538,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--max_samples', type=int, default=None)
-    parser.add_argument('--max_answer_vocab_size', type=int, default=120)
+    parser.add_argument('--max_answer_vocab_size', type=int, default=150)
     
     parser.add_argument('--output_dir', type=str, default='evaluation_results')
     parser.add_argument('--device', type=str, default=None)

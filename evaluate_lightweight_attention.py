@@ -40,12 +40,16 @@ os.environ.setdefault("HF_HOME", str(HF_CACHE_ROOT))
 os.environ.setdefault("HF_DATASETS_CACHE", str(HF_DATASETS_CACHE))
 os.environ.setdefault("HF_HUB_CACHE", str(HF_HUB_CACHE))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_HUB_CACHE))
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE))
 
 HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
 HF_HUB_CACHE.mkdir(parents=True, exist_ok=True)
 MPL_CACHE.mkdir(parents=True, exist_ok=True)
+
+# ---- FORCE HUGGING FACE ONLINE MODE ----
+os.environ["HF_DATASETS_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
+os.environ["HF_HUB_OFFLINE"] = "0"
 
 from combined_preprocessing import create_combined_data_loaders
 from lightweight_model import LightweightVQAModel

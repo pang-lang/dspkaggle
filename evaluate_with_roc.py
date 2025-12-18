@@ -30,9 +30,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from preprocessing.combined_preprocessing import create_combined_data_loaders
-from models.lightweight_model import LightweightVQAModel
-from models.baseline_model_attention import BaselineVQAModel
+from combined_preprocessing import create_combined_data_loaders
+from lightweight_model import LightweightVQAModel
+from baseline_model_attention import BaselineVQAModel
 
 
 class EnhancedModelEvaluator:

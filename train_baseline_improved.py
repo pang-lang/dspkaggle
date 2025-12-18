@@ -474,7 +474,7 @@ def main():
         'batch_size': 24,
         'learning_rate': 1e-4,
         'num_epochs': 30,  # CHANGED from 15
-        'max_answer_vocab_size': 120,
+        'max_answer_vocab_size': 150,
         'fusion_hidden_dim': 384,  # CHANGED from 512
         'num_attention_heads': 6,  # CHANGED from 4
         'dropout': 0.35,  # CHANGED from 0.3

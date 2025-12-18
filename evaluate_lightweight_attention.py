@@ -47,8 +47,8 @@ HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
 HF_HUB_CACHE.mkdir(parents=True, exist_ok=True)
 MPL_CACHE.mkdir(parents=True, exist_ok=True)
 
-from preprocessing.combined_preprocessing import create_combined_data_loaders
-from models.lightweight_model import LightweightVQAModel
+from combined_preprocessing import create_combined_data_loaders
+from lightweight_model import LightweightVQAModel
 
 
 def _checkpoint_path() -> Path:

@@ -1,1 +1,468 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.12.12","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[{"sourceId":14199874,"sourceType":"datasetVersion","datasetId":9055827}],"dockerImageVersionId":31234,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"#!/usr/bin/env python3\n\"\"\"\nRecovery Training Script\nOptimized to recover the lost model's performance (66.54% test, 33% multi-F1)\nUses proven techniques to get accuracy back up\n\"\"\"\n\nimport sys\nfrom pathlib import Path\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch.optim as optim\nfrom torch.utils.data import DataLoader\nfrom torch.optim.lr_scheduler import ReduceLROnPlateau\nfrom tqdm import tqdm\nimport logging\nimport os\nfrom datetime import datetime\nimport matplotlib.pyplot as plt\nimport numpy as np\nfrom collections import Counter\n\nfrom combined_preprocessing import create_combined_data_loaders\nfrom lightweight_model import LightweightVQAModel\n\n\nclass ImprovedFocalLoss(nn.Module):\n    \"\"\"Focal Loss with per-class weights.\"\"\"\n    \n    def __init__(self, alpha=None, gamma=2.5, reduction='mean'):\n        super().__init__()\n        self.alpha = alpha\n        self.gamma = gamma\n        self.reduction = reduction\n    \n    def forward(self, inputs, targets):\n        ce_loss = F.cross_entropy(inputs, targets, reduction='none')\n        pt = torch.exp(-ce_loss)\n        focal_loss = (1 - pt) ** self.gamma * ce_loss\n        \n        if self.alpha is not None:\n            alpha_t = self.alpha[targets]\n            focal_loss = alpha_t * focal_loss\n        \n        if self.reduction == 'mean':\n            return focal_loss.mean()\n        return focal_loss\n\n\nclass EarlyStopping:\n    \"\"\"Early stopping with more patience.\"\"\"\n    \n    def __init__(self, patience=10, min_delta=0.001):\n        self.patience = patience\n        self.min_delta = min_delta\n        self.counter = 0\n        self.best_score = None\n        self.early_stop = False\n        \n    def __call__(self, val_acc):\n        if self.best_score is None:\n            self.best_score = val_acc\n        elif val_acc < self.best_score + self.min_delta:\n            self.counter += 1\n            if self.counter >= self.patience:\n                self.early_stop = True\n        else:\n            self.best_score = val_acc\n            self.counter = 0\n        \n        return self.early_stop\n\n\nclass RecoveryTrainer:\n    \"\"\"Trainer optimized to match original performance.\"\"\"\n    \n    def __init__(self,\n                 num_answers: int,\n                 batch_size: int = 24,\n                 learning_rate: float = 1e-4,\n                 num_epochs: int = 30,\n                 device: str = None,\n                 checkpoint_dir: str = 'checkpoints/recovery_training',\n                 # Optimized parameters based on successful training\n                 fusion_hidden_dim: int = 384,\n                 num_attention_heads: int = 6,\n                 dropout: float = 0.35,  # Slightly reduced\n                 focal_gamma: float = 2.5,  # Balanced\n                 weight_decay: float = 0.007,  # Moderate\n                 early_stopping_patience: int = 10):  # More patience\n        \n        self.num_answers = num_answers\n        self.batch_size = batch_size\n        self.learning_rate = learning_rate\n        self.num_epochs = num_epochs\n        self.checkpoint_dir = checkpoint_dir\n        \n        self.fusion_hidden_dim = fusion_hidden_dim\n        self.num_attention_heads = num_attention_heads\n        self.dropout = dropout\n        self.focal_gamma = focal_gamma\n        self.weight_decay = weight_decay\n        \n        if device:\n            self.device = torch.device(device)\n        elif torch.cuda.is_available():\n            self.device = torch.device('cuda')\n        elif torch.backends.mps.is_available():\n            self.device = torch.device('mps')\n        else:\n            self.device = torch.device('cpu')\n        \n        os.makedirs(self.checkpoint_dir, exist_ok=True)\n        self.setup_logging()\n        \n        self.model = None\n        self.optimizer = None\n        self.scheduler = None\n        self.criterion = None\n        self.class_weights = None\n        self.early_stopping = EarlyStopping(patience=early_stopping_patience)\n        \n        self.history = {\n            'train_loss': [],\n            'val_loss': [],\n            'train_acc': [],\n            'val_acc': [],\n            'learning_rates': []\n        }\n        self.best_val_acc = 0.0\n        self.best_val_loss = float('inf')\n    \n    def setup_logging(self):\n        log_file = os.path.join(self.checkpoint_dir, 'training.log')\n        logging.basicConfig(\n            level=logging.INFO,\n            format='%(asctime)s [%(levelname)s] %(message)s',\n            handlers=[\n                logging.FileHandler(log_file),\n                logging.StreamHandler()\n            ],\n            force=True\n        )\n        self.logger = logging.getLogger(__name__)\n    \n    def calculate_class_weights(self, train_loader: DataLoader) -> torch.Tensor:\n        \"\"\"Calculate balanced class weights.\"\"\"\n        self.logger.info(\"Calculating class weights...\")\n        all_labels = []\n        for batch in tqdm(train_loader, desc='Analyzing class distribution'):\n            all_labels.extend(batch['answer_idx'].tolist())\n        \n        label_counts = Counter(all_labels)\n        total = len(all_labels)\n        \n        weights = torch.zeros(self.num_answers)\n        for label in range(self.num_answers):\n            count = label_counts.get(label, 0)\n            if count > 0:\n                # Smoothed inverse frequency\n                weights[label] = np.sqrt(total / (count + 50))\n            else:\n                weights[label] = 0.1\n        \n        weights = weights / weights.mean()\n        weights = torch.clamp(weights, min=0.3, max=5.0)\n        \n        self.logger.info(f\"Class weights - min: {weights.min():.3f}, \"\n                        f\"max: {weights.max():.3f}, mean: {weights.mean():.3f}\")\n        \n        return weights\n    \n    def initialize_model(self, train_loader: DataLoader):\n        \"\"\"Initialize model.\"\"\"\n        self.logger.info(\"=\" * 80)\n        self.logger.info(\"INITIALIZING RECOVERY TRAINING\")\n        self.logger.info(\"=\" * 80)\n        self.logger.info(f\"Target: Match original performance (66.54% test, 33% multi-F1)\")\n        self.logger.info(f\"Device: {self.device}\")\n        self.logger.info(\"=\" * 80)\n        \n        self.model = LightweightVQAModel(\n            num_classes=self.num_answers,\n            fusion_hidden_dim=self.fusion_hidden_dim,\n            num_attention_heads=self.num_attention_heads,\n            dropout=self.dropout,\n            freeze_vision_encoder=False,\n            freeze_text_encoder=False,\n            use_spatial_features=False\n        ).to(self.device)\n        \n        self.class_weights = self.calculate_class_weights(train_loader).to(self.device)\n        \n        self.optimizer = optim.AdamW(\n            self.model.parameters(),\n            lr=self.learning_rate,\n            betas=(0.9, 0.999),\n            weight_decay=self.weight_decay,\n            eps=1e-8\n        )\n        \n        self.scheduler = ReduceLROnPlateau(\n            self.optimizer,\n            mode='max',\n            factor=0.5,\n            patience=4,  # More patience\n            min_lr=1e-7\n        )\n        \n        self.criterion = ImprovedFocalLoss(\n            alpha=self.class_weights,\n            gamma=self.focal_gamma\n        )\n        \n        total_params = sum(p.numel() for p in self.model.parameters())\n        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)\n        \n        self.logger.info(f\"✅ Model initialized - {trainable_params:,} trainable params\")\n    \n    def train_epoch(self, train_loader: DataLoader, epoch: int):\n        \"\"\"Train for one epoch.\"\"\"\n        self.model.train()\n        total_loss = 0.0\n        correct = 0\n        total = 0\n        \n        progress = tqdm(train_loader, desc=f'Epoch {epoch} Training')\n        for batch in progress:\n            images = batch['image'].to(self.device)\n            question_ids = batch['question']['input_ids'].to(self.device)\n            question_mask = batch['question']['attention_mask'].to(self.device)\n            answers = batch['answer_idx'].to(self.device)\n            \n            self.optimizer.zero_grad()\n            logits = self.model(images, question_ids, question_mask)\n            loss = self.criterion(logits, answers)\n            \n            loss.backward()\n            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)\n            self.optimizer.step()\n            \n            total_loss += loss.item()\n            predictions = torch.argmax(logits, dim=1)\n            correct += (predictions == answers).sum().item()\n            total += answers.size(0)\n            \n            progress.set_postfix({\n                'loss': f'{loss.item():.4f}',\n                'acc': f'{100 * correct / total:.2f}%'\n            })\n        \n        return total_loss / len(train_loader), 100 * correct / total\n    \n    def validate(self, val_loader: DataLoader):\n        \"\"\"Validate model.\"\"\"\n        self.model.eval()\n        total_loss = 0.0\n        correct = 0\n        total = 0\n        \n        with torch.no_grad():\n            progress = tqdm(val_loader, desc='Validation')\n            for batch in progress:\n                images = batch['image'].to(self.device)\n                question_ids = batch['question']['input_ids'].to(self.device)\n                question_mask = batch['question']['attention_mask'].to(self.device)\n                answers = batch['answer_idx'].to(self.device)\n                \n                logits = self.model(images, question_ids, question_mask)\n                loss = self.criterion(logits, answers)\n                \n                total_loss += loss.item()\n                predictions = torch.argmax(logits, dim=1)\n                correct += (predictions == answers).sum().item()\n                total += answers.size(0)\n                \n                progress.set_postfix({\n                    'loss': f'{loss.item():.4f}',\n                    'acc': f'{100 * correct / total:.2f}%'\n                })\n        \n        return total_loss / len(val_loader), 100 * correct / total\n    \n    def save_checkpoint(self, epoch: int, val_loss: float, val_acc: float, is_best: bool = False):\n        \"\"\"Save checkpoint.\"\"\"\n        checkpoint = {\n            'epoch': epoch,\n            'model_state_dict': self.model.state_dict(),\n            'optimizer_state_dict': self.optimizer.state_dict(),\n            'scheduler_state_dict': self.scheduler.state_dict(),\n            'val_loss': val_loss,\n            'val_acc': val_acc,\n            'history': self.history,\n            'config': {\n                'num_answers': self.num_answers,\n                'batch_size': self.batch_size,\n                'learning_rate': self.learning_rate,\n                'num_epochs': self.num_epochs,\n                'architecture': 'lightweight_attention_recovery',\n                'fusion_hidden_dim': self.fusion_hidden_dim,\n                'num_attention_heads': self.num_attention_heads,\n                'dropout': self.dropout,\n                'focal_gamma': self.focal_gamma,\n                'weight_decay': self.weight_decay,\n            }\n        }\n        \n        if is_best:\n            best_path = os.path.join(self.checkpoint_dir, 'best_model_recovered.pt')\n            torch.save(checkpoint, best_path)\n            self.logger.info(f\"🌟 Saved BEST model (Val Acc: {val_acc:.2f}%)\")\n        \n        latest_path = os.path.join(self.checkpoint_dir, 'latest_model.pt')\n        torch.save(checkpoint, latest_path)\n    \n    def plot_training_history(self):\n        fig, axes = plt.subplots(2, 2, figsize=(15, 10))\n        epochs = range(1, len(self.history['train_loss']) + 1)\n\n        # ---- (1) LOSS CURVE ----\n        axes[0, 0].plot(epochs, self.history['train_loss'], label='Train', linewidth=2)\n        axes[0, 0].plot(epochs, self.history['val_loss'], label='Val', linewidth=2)\n        axes[0, 0].set_title('Loss')\n        axes[0, 0].legend()\n        axes[0, 0].grid(True, alpha=0.3)\n\n        # ---- (2) ACCURACY CURVE ----\n        axes[0, 1].plot(epochs, self.history['train_acc'], label='Train', linewidth=2)\n        axes[0, 1].plot(epochs, self.history['val_acc'], label='Val', linewidth=2)\n        axes[0, 1].set_title('Accuracy (%)')\n        axes[0, 1].legend()\n        axes[0, 1].grid(True, alpha=0.3)\n\n        # ---- (3) LEARNING RATE ----\n        axes[1, 0].plot(epochs, self.history['learning_rates'], color='green', linewidth=2)\n        axes[1, 0].set_title('Learning Rate (log scale)')\n        axes[1, 0].set_yscale('log')\n        axes[1, 0].grid(True, alpha=0.3)\n\n        # ---- (4) OVERFITTING GAP ----\n        gap = [t - v for t, v in zip(self.history['train_acc'], self.history['val_acc'])]\n        axes[1, 1].plot(epochs, gap, color='purple', linewidth=2)\n        axes[1, 1].set_title('Overfitting Gap (Train - Val)')\n        axes[1, 1].grid(True, alpha=0.3)\n\n        plt.tight_layout()\n\n        plot_path = os.path.join(self.checkpoint_dir, 'training_curves_simple.png')\n        plt.savefig(plot_path, dpi=300, bbox_inches='tight')\n        plt.close()\n\n        self.logger.info(f\"📊 Training curves saved to: {plot_path}\")\n\n    def train(self, train_loader: DataLoader, val_loader: DataLoader):\n        \"\"\"Main training loop.\"\"\"\n        start_time = datetime.now()\n        \n        self.logger.info(\"\\n\" + \"=\" * 80)\n        self.logger.info(\"RECOVERY TRAINING START\")\n        self.logger.info(\"=\" * 80)\n        \n        for epoch in range(1, self.num_epochs + 1):\n            self.logger.info(f\"\\n{'='*80}\")\n            self.logger.info(f\"EPOCH {epoch}/{self.num_epochs}\")\n            self.logger.info(f\"{'='*80}\")\n            \n            train_loss, train_acc = self.train_epoch(train_loader, epoch)\n            self.logger.info(f\"✓ Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%\")\n            \n            val_loss, val_acc = self.validate(val_loader)\n            self.logger.info(f\"✓ Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%\")\n            \n            # Check if we've matched or exceeded original performance\n            if val_acc >= 64.0 and train_acc >= 70.0:\n                self.logger.info(f\"🎯 Good performance achieved! Val: {val_acc:.2f}%, Train: {train_acc:.2f}%\")\n            \n            self.scheduler.step(val_acc)\n            current_lr = self.optimizer.param_groups[0]['lr']\n            self.logger.info(f\"📉 Learning rate: {current_lr:.2e}\")\n            \n            self.history['train_loss'].append(train_loss)\n            self.history['val_loss'].append(val_loss)\n            self.history['train_acc'].append(train_acc)\n            self.history['val_acc'].append(val_acc)\n            self.history['learning_rates'].append(current_lr)\n            \n            is_best = val_acc > self.best_val_acc\n            if is_best:\n                self.best_val_acc = val_acc\n                self.best_val_loss = val_loss\n                self.save_checkpoint(epoch, val_loss, val_acc, is_best=True)\n            else:\n                self.save_checkpoint(epoch, val_loss, val_acc, is_best=False)\n            \n            if self.early_stopping(val_acc):\n                self.logger.info(f\"\\n⚠️  Early stopping at epoch {epoch}\")\n                break\n        \n        duration = (datetime.now() - start_time).total_seconds()\n        \n        self.plot_training_history()\n        self.logger.info(\"\\n\" + \"=\" * 80)\n        self.logger.info(\"🎉 RECOVERY TRAINING COMPLETED!\")\n        self.logger.info(\"=\" * 80)\n        self.logger.info(f\"Time: {duration/60:.2f} minutes\")\n        self.logger.info(f\"Best Val Acc: {self.best_val_acc:.2f}%\")\n        self.logger.info(f\"Target was: 63.94% val, 66.54% test, 33% multi-F1\")\n        self.logger.info(\"=\" * 80)\n\n\ndef main():\n    params = {\n        'batch_size': 24,\n        'learning_rate': 1e-4,\n        'num_epochs': 30,\n        'max_answer_vocab_size': 250,\n        'fusion_hidden_dim': 384,\n        'num_attention_heads': 6,\n        'dropout': 0.35,  # Slightly reduced from 0.4\n        'focal_gamma': 2.5,  # Balanced\n        'weight_decay': 0.007,  # Moderate\n        'early_stopping_patience': 10  # More patience\n    }\n    \n    print(\"=\" * 80)\n    print(\"🔧 RECOVERY TRAINING\")\n    print(\"Target: Match original performance (66.54% test, 33% multi-F1)\")\n    print(\"=\" * 80)\n    print(\"\\n📋 Optimized Configuration:\")\n    for key, value in params.items():\n        print(f\"   {key}: {value}\")\n    print(\"=\" * 80)\n    \n    print(\"\\n📦 Loading data...\")\n    train_loader, val_loader, test_loader, answer_vocab, _ = create_combined_data_loaders(\n        batch_size=params['batch_size'],\n        max_samples=None,\n        num_workers=0,\n        max_answer_vocab_size=params['max_answer_vocab_size']\n    )\n    \n    num_answers = len(answer_vocab)\n    print(f\"✓ Answers: {num_answers}\")\n    print(f\"✓ Train batches: {len(train_loader)}\")\n    print(f\"✓ Val batches: {len(val_loader)}\")\n    \n    trainer = RecoveryTrainer(\n        num_answers=num_answers,\n        **{k: v for k, v in params.items() if k not in ['max_answer_vocab_size']}\n    )\n    \n    trainer.initialize_model(train_loader)\n    trainer.train(train_loader, val_loader)\n    \n    print(\"\\n✅ Training complete! Evaluate with:\")\n    print(\"  python evaluate_with_roc.py --checkpoint checkpoints/recovery_training/best_model_recovered.pt\")\n\n\nif __name__ == \"__main__\":\n    main()","metadata":{"_uuid":"71e88abf-39ec-4a6d-bcbf-2d50c606957d","_cell_guid":"025edce3-e331-453f-9987-40946eea620b","trusted":true,"collapsed":false,"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-12-18T00:34:44.744553Z","iopub.execute_input":"2025-12-18T00:34:44.745197Z","iopub.status.idle":"2025-12-18T00:34:44.792739Z","shell.execute_reply.started":"2025-12-18T00:34:44.745161Z","shell.execute_reply":"2025-12-18T00:34:44.791820Z"}},"outputs":[{"traceback":["\u001b[0;31m---------------------------------------------------------------------------\u001b[0m","\u001b[0;31mModuleNotFoundError\u001b[0m                       Traceback (most recent call last)","\u001b[0;32m/tmp/ipykernel_55/3874989410.py\u001b[0m in \u001b[0;36m<cell line: 0>\u001b[0;34m()\u001b[0m\n\u001b[1;32m     22\u001b[0m \u001b[0;32mfrom\u001b[0m \u001b[0mcollections\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mCounter\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     23\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m---> 24\u001b[0;31m \u001b[0;32mfrom\u001b[0m \u001b[0mcombined_preprocessing\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mcreate_combined_data_loaders\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m     25\u001b[0m \u001b[0;32mfrom\u001b[0m \u001b[0mlightweight_model\u001b[0m \u001b[0;32mimport\u001b[0m \u001b[0mLightweightVQAModel\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     26\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n","\u001b[0;31mModuleNotFoundError\u001b[0m: No module named 'combined_preprocessing'"],"ename":"ModuleNotFoundError","evalue":"No module named 'combined_preprocessing'","output_type":"error"}],"execution_count":5}]}
+#!/usr/bin/env python3
+"""
+Recovery Training Script
+Optimized to recover the lost model's performance (66.54% test, 33% multi-F1)
+Uses proven techniques to get accuracy back up
+"""
+
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
+import logging
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
+import numpy as np
+from collections import Counter
+
+from preprocessing.combined_preprocessing import create_combined_data_loaders
+from models.lightweight_model import LightweightVQAModel
+
+
+class ImprovedFocalLoss(nn.Module):
+    """Focal Loss with per-class weights."""
+    
+    def __init__(self, alpha=None, gamma=2.5, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        return focal_loss
+
+
+class EarlyStopping:
+    """Early stopping with more patience."""
+    
+    def __init__(self, patience=10, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        
+    def __call__(self, val_acc):
+        if self.best_score is None:
+            self.best_score = val_acc
+        elif val_acc < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = val_acc
+            self.counter = 0
+        
+        return self.early_stop
+
+
+class RecoveryTrainer:
+    """Trainer optimized to match original performance."""
+    
+    def __init__(self,
+                 num_answers: int,
+                 batch_size: int = 24,
+                 learning_rate: float = 1e-4,
+                 num_epochs: int = 30,
+                 device: str = None,
+                 checkpoint_dir: str = 'checkpoints/recovery_training',
+                 # Optimized parameters based on successful training
+                 fusion_hidden_dim: int = 384,
+                 num_attention_heads: int = 6,
+                 dropout: float = 0.35,  # Slightly reduced
+                 focal_gamma: float = 2.5,  # Balanced
+                 weight_decay: float = 0.007,  # Moderate
+                 early_stopping_patience: int = 10):  # More patience
+        
+        self.num_answers = num_answers
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.num_epochs = num_epochs
+        self.checkpoint_dir = checkpoint_dir
+        
+        self.fusion_hidden_dim = fusion_hidden_dim
+        self.num_attention_heads = num_attention_heads
+        self.dropout = dropout
+        self.focal_gamma = focal_gamma
+        self.weight_decay = weight_decay
+        
+        if device:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+        else:
+            self.device = torch.device('cpu')
+        
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.setup_logging()
+        
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.criterion = None
+        self.class_weights = None
+        self.early_stopping = EarlyStopping(patience=early_stopping_patience)
+        
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'train_acc': [],
+            'val_acc': [],
+            'learning_rates': []
+        }
+        self.best_val_acc = 0.0
+        self.best_val_loss = float('inf')
+    
+    def setup_logging(self):
+        log_file = os.path.join(self.checkpoint_dir, 'training.log')
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ],
+            force=True
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def calculate_class_weights(self, train_loader: DataLoader) -> torch.Tensor:
+        """Calculate balanced class weights."""
+        self.logger.info("Calculating class weights...")
+        all_labels = []
+        for batch in tqdm(train_loader, desc='Analyzing class distribution'):
+            all_labels.extend(batch['answer_idx'].tolist())
+        
+        label_counts = Counter(all_labels)
+        total = len(all_labels)
+        
+        weights = torch.zeros(self.num_answers)
+        for label in range(self.num_answers):
+            count = label_counts.get(label, 0)
+            if count > 0:
+                # Smoothed inverse frequency
+                weights[label] = np.sqrt(total / (count + 50))
+            else:
+                weights[label] = 0.1
+        
+        weights = weights / weights.mean()
+        weights = torch.clamp(weights, min=0.3, max=5.0)
+        
+        self.logger.info(f"Class weights - min: {weights.min():.3f}, "
+                        f"max: {weights.max():.3f}, mean: {weights.mean():.3f}")
+        
+        return weights
+    
+    def initialize_model(self, train_loader: DataLoader):
+        """Initialize model."""
+        self.logger.info("=" * 80)
+        self.logger.info("INITIALIZING RECOVERY TRAINING")
+        self.logger.info("=" * 80)
+        self.logger.info(f"Target: Match original performance (66.54% test, 33% multi-F1)")
+        self.logger.info(f"Device: {self.device}")
+        self.logger.info("=" * 80)
+        
+        self.model = LightweightVQAModel(
+            num_classes=self.num_answers,
+            fusion_hidden_dim=self.fusion_hidden_dim,
+            num_attention_heads=self.num_attention_heads,
+            dropout=self.dropout,
+            freeze_vision_encoder=False,
+            freeze_text_encoder=False,
+            use_spatial_features=False
+        ).to(self.device)
+        
+        self.class_weights = self.calculate_class_weights(train_loader).to(self.device)
+        
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            weight_decay=self.weight_decay,
+            eps=1e-8
+        )
+        
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=4,  # More patience
+            min_lr=1e-7
+        )
+        
+        self.criterion = ImprovedFocalLoss(
+            alpha=self.class_weights,
+            gamma=self.focal_gamma
+        )
+        
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        self.logger.info(f"✅ Model initialized - {trainable_params:,} trainable params")
+    
+    def train_epoch(self, train_loader: DataLoader, epoch: int):
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        progress = tqdm(train_loader, desc=f'Epoch {epoch} Training')
+        for batch in progress:
+            images = batch['image'].to(self.device)
+            question_ids = batch['question']['input_ids'].to(self.device)
+            question_mask = batch['question']['attention_mask'].to(self.device)
+            answers = batch['answer_idx'].to(self.device)
+            
+            self.optimizer.zero_grad()
+            logits = self.model(images, question_ids, question_mask)
+            loss = self.criterion(logits, answers)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            predictions = torch.argmax(logits, dim=1)
+            correct += (predictions == answers).sum().item()
+            total += answers.size(0)
+            
+            progress.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100 * correct / total:.2f}%'
+            })
+        
+        return total_loss / len(train_loader), 100 * correct / total
+    
+    def validate(self, val_loader: DataLoader):
+        """Validate model."""
+        self.model.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            progress = tqdm(val_loader, desc='Validation')
+            for batch in progress:
+                images = batch['image'].to(self.device)
+                question_ids = batch['question']['input_ids'].to(self.device)
+                question_mask = batch['question']['attention_mask'].to(self.device)
+                answers = batch['answer_idx'].to(self.device)
+                
+                logits = self.model(images, question_ids, question_mask)
+                loss = self.criterion(logits, answers)
+                
+                total_loss += loss.item()
+                predictions = torch.argmax(logits, dim=1)
+                correct += (predictions == answers).sum().item()
+                total += answers.size(0)
+                
+                progress.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{100 * correct / total:.2f}%'
+                })
+        
+        return total_loss / len(val_loader), 100 * correct / total
+    
+    def save_checkpoint(self, epoch: int, val_loss: float, val_acc: float, is_best: bool = False):
+        """Save checkpoint."""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'history': self.history,
+            'config': {
+                'num_answers': self.num_answers,
+                'batch_size': self.batch_size,
+                'learning_rate': self.learning_rate,
+                'num_epochs': self.num_epochs,
+                'architecture': 'lightweight_attention_recovery',
+                'fusion_hidden_dim': self.fusion_hidden_dim,
+                'num_attention_heads': self.num_attention_heads,
+                'dropout': self.dropout,
+                'focal_gamma': self.focal_gamma,
+                'weight_decay': self.weight_decay,
+            }
+        }
+        
+        if is_best:
+            best_path = os.path.join(self.checkpoint_dir, 'best_model_recovered.pt')
+            torch.save(checkpoint, best_path)
+            self.logger.info(f"🌟 Saved BEST model (Val Acc: {val_acc:.2f}%)")
+        
+        latest_path = os.path.join(self.checkpoint_dir, 'latest_model.pt')
+        torch.save(checkpoint, latest_path)
+    
+    def plot_training_history(self):
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        epochs = range(1, len(self.history['train_loss']) + 1)
+
+        # ---- (1) LOSS CURVE ----
+        axes[0, 0].plot(epochs, self.history['train_loss'], label='Train', linewidth=2)
+        axes[0, 0].plot(epochs, self.history['val_loss'], label='Val', linewidth=2)
+        axes[0, 0].set_title('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # ---- (2) ACCURACY CURVE ----
+        axes[0, 1].plot(epochs, self.history['train_acc'], label='Train', linewidth=2)
+        axes[0, 1].plot(epochs, self.history['val_acc'], label='Val', linewidth=2)
+        axes[0, 1].set_title('Accuracy (%)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # ---- (3) LEARNING RATE ----
+        axes[1, 0].plot(epochs, self.history['learning_rates'], color='green', linewidth=2)
+        axes[1, 0].set_title('Learning Rate (log scale)')
+        axes[1, 0].set_yscale('log')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # ---- (4) OVERFITTING GAP ----
+        gap = [t - v for t, v in zip(self.history['train_acc'], self.history['val_acc'])]
+        axes[1, 1].plot(epochs, gap, color='purple', linewidth=2)
+        axes[1, 1].set_title('Overfitting Gap (Train - Val)')
+        axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        plot_path = os.path.join(self.checkpoint_dir, 'training_curves_simple.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        self.logger.info(f"📊 Training curves saved to: {plot_path}")
+
+    def train(self, train_loader: DataLoader, val_loader: DataLoader):
+        """Main training loop."""
+        start_time = datetime.now()
+        
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("RECOVERY TRAINING START")
+        self.logger.info("=" * 80)
+        
+        for epoch in range(1, self.num_epochs + 1):
+            self.logger.info(f"\n{'='*80}")
+            self.logger.info(f"EPOCH {epoch}/{self.num_epochs}")
+            self.logger.info(f"{'='*80}")
+            
+            train_loss, train_acc = self.train_epoch(train_loader, epoch)
+            self.logger.info(f"✓ Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+            
+            val_loss, val_acc = self.validate(val_loader)
+            self.logger.info(f"✓ Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+            
+            # Check if we've matched or exceeded original performance
+            if val_acc >= 64.0 and train_acc >= 70.0:
+                self.logger.info(f"🎯 Good performance achieved! Val: {val_acc:.2f}%, Train: {train_acc:.2f}%")
+            
+            self.scheduler.step(val_acc)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.logger.info(f"📉 Learning rate: {current_lr:.2e}")
+            
+            self.history['train_loss'].append(train_loss)
+            self.history['val_loss'].append(val_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_acc'].append(val_acc)
+            self.history['learning_rates'].append(current_lr)
+            
+            is_best = val_acc > self.best_val_acc
+            if is_best:
+                self.best_val_acc = val_acc
+                self.best_val_loss = val_loss
+                self.save_checkpoint(epoch, val_loss, val_acc, is_best=True)
+            else:
+                self.save_checkpoint(epoch, val_loss, val_acc, is_best=False)
+            
+            if self.early_stopping(val_acc):
+                self.logger.info(f"\n⚠️  Early stopping at epoch {epoch}")
+                break
+        
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        self.plot_training_history()
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("🎉 RECOVERY TRAINING COMPLETED!")
+        self.logger.info("=" * 80)
+        self.logger.info(f"Time: {duration/60:.2f} minutes")
+        self.logger.info(f"Best Val Acc: {self.best_val_acc:.2f}%")
+        self.logger.info(f"Target was: 63.94% val, 66.54% test, 33% multi-F1")
+        self.logger.info("=" * 80)
+
+
+def main():
+    params = {
+        'batch_size': 24,
+        'learning_rate': 1e-4,
+        'num_epochs': 30,
+        'max_answer_vocab_size': 250,
+        'fusion_hidden_dim': 384,
+        'num_attention_heads': 6,
+        'dropout': 0.35,  # Slightly reduced from 0.4
+        'focal_gamma': 2.5,  # Balanced
+        'weight_decay': 0.007,  # Moderate
+        'early_stopping_patience': 10  # More patience
+    }
+    
+    print("=" * 80)
+    print("🔧 RECOVERY TRAINING")
+    print("Target: Match original performance (66.54% test, 33% multi-F1)")
+    print("=" * 80)
+    print("\n📋 Optimized Configuration:")
+    for key, value in params.items():
+        print(f"   {key}: {value}")
+    print("=" * 80)
+    
+    print("\n📦 Loading data...")
+    train_loader, val_loader, test_loader, answer_vocab, _ = create_combined_data_loaders(
+        batch_size=params['batch_size'],
+        max_samples=None,
+        num_workers=0,
+        max_answer_vocab_size=params['max_answer_vocab_size']
+    )
+    
+    num_answers = len(answer_vocab)
+    print(f"✓ Answers: {num_answers}")
+    print(f"✓ Train batches: {len(train_loader)}")
+    print(f"✓ Val batches: {len(val_loader)}")
+    
+    trainer = RecoveryTrainer(
+        num_answers=num_answers,
+        **{k: v for k, v in params.items() if k not in ['max_answer_vocab_size']}
+    )
+    
+    trainer.initialize_model(train_loader)
+    trainer.train(train_loader, val_loader)
+    
+    print("\n✅ Training complete! Evaluate with:")
+    print("  python evaluate_with_roc.py --checkpoint checkpoints/recovery_training/best_model_recovered.pt")
+
+
+if __name__ == "__main__":
+    main()
+

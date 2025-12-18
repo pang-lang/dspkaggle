@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Training script for baseline attention-fusion model (ResNet34 + BERT).
-Includes class weights, focal loss, cosine schedule, and logging.
+MATCHED TO LIGHTWEIGHT PARAMETERS for fair comparison.
 """
 
 import sys
@@ -17,9 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from baseline_model_attention import BaselineVQAModel, print_model_summary
-from combined_preprocessing import create_combined_data_loaders
+from torch.optim.lr_scheduler import ReduceLROnPlateau  # CHANGED: Match lightweight
+from models.baseline_model_attention import BaselineVQAModel, print_model_summary
+from preprocessing.combined_preprocessing import create_combined_data_loaders
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -29,9 +29,10 @@ import matplotlib.pyplot as plt
 from collections import Counter
 
 
-class FocalLoss(nn.Module):
-    """Focal Loss for handling class imbalance."""
-    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+class ImprovedFocalLoss(nn.Module):
+    """Focal Loss with per-class weights - MATCHED to lightweight."""
+    
+    def __init__(self, alpha=None, gamma=2.5, reduction='mean'):  # CHANGED: gamma=2.5
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -40,36 +41,71 @@ class FocalLoss(nn.Module):
     def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
         
         if self.reduction == 'mean':
             return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
+        return focal_loss
+
+
+class EarlyStopping:
+    """Early stopping - MATCHED to lightweight."""
+    
+    def __init__(self, patience=10, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        
+    def __call__(self, val_acc):
+        if self.best_score is None:
+            self.best_score = val_acc
+        elif val_acc < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
         else:
-            return focal_loss
+            self.best_score = val_acc
+            self.counter = 0
+        
+        return self.early_stop
 
 
-class UltimateVQATrainer:
+class MatchedBaselineTrainer:
     def __init__(self,
                  num_answers: int,
                  batch_size: int = 24,
                  learning_rate: float = 1e-4,
-                 num_epochs: int = 15,
+                 num_epochs: int = 30,  # CHANGED: Match lightweight
                  device: str = None,
-                 checkpoint_dir: str = 'checkpoints/baseline_attention',
-                 use_focal_loss: bool = True,
-                 use_class_weights: bool = False):
+                 checkpoint_dir: str = 'checkpoints/baseline_matched',
+                 # MATCHED PARAMETERS
+                 fusion_hidden_dim: int = 384,  # CHANGED: Was 512
+                 num_attention_heads: int = 6,  # CHANGED: Was 4
+                 dropout: float = 0.35,  # CHANGED: Was 0.3
+                 focal_gamma: float = 2.5,  # CHANGED: Was 2.0
+                 weight_decay: float = 0.007,  # CHANGED: Was 0.01
+                 early_stopping_patience: int = 10):  # NEW
         """
-        Initialize ultimate trainer with all improvements.
+        Initialize trainer with parameters MATCHED to lightweight model.
         """
         self.num_answers = num_answers
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.num_epochs = num_epochs
         self.checkpoint_dir = checkpoint_dir
-        self.use_focal_loss = use_focal_loss
-        self.use_class_weights = use_class_weights
+        
+        # Architecture parameters
+        self.fusion_hidden_dim = fusion_hidden_dim
+        self.num_attention_heads = num_attention_heads
+        self.dropout = dropout
+        self.focal_gamma = focal_gamma
+        self.weight_decay = weight_decay
         
         # Device
         if device:
@@ -89,6 +125,7 @@ class UltimateVQATrainer:
         self.scheduler = None
         self.criterion = None
         self.class_weights = None
+        self.early_stopping = EarlyStopping(patience=early_stopping_patience)
         
         # Training history
         self.history = {
@@ -104,18 +141,20 @@ class UltimateVQATrainer:
     
     def setup_logging(self):
         """Setup logging configuration."""
+        log_file = os.path.join(self.checkpoint_dir, 'training.log')
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s [%(levelname)s] %(message)s',
             handlers=[
-                logging.FileHandler('training_baseline_attention.log'),
+                logging.FileHandler(log_file),
                 logging.StreamHandler()
-            ]
+            ],
+            force=True
         )
         self.logger = logging.getLogger(__name__)
     
     def calculate_class_weights(self, train_loader):
-        """Calculate class weights for imbalanced data."""
+        """Calculate class weights - MATCHED to lightweight."""
         self.logger.info("Calculating class weights...")
         
         all_labels = []
@@ -127,97 +166,94 @@ class UltimateVQATrainer:
         
         self.logger.info(f"Total samples: {total}")
         self.logger.info(f"Number of classes: {len(label_counts)}")
-        self.logger.info(f"Most common: {label_counts.most_common(5)}")
-        self.logger.info(f"Least common: {list(label_counts.most_common())[-5:]}")
         
-        # Inverse frequency weighting with smoothing
+        # MATCHED weighting scheme from lightweight
         weights = torch.zeros(self.num_answers)
         for label in range(self.num_answers):
             count = label_counts.get(label, 0)
             if count > 0:
-                # Smooth inverse frequency
-                weights[label] = np.log(total / (count + 10))
+                # Smoothed inverse frequency with sqrt
+                weights[label] = np.sqrt(total / (count + 50))
             else:
-                weights[label] = 0.0
+                weights[label] = 0.1
         
-        # Normalize weights
-        weights = weights / weights.sum() * self.num_answers
-        weights = torch.clamp(weights, min=0.1, max=10.0)
+        weights = weights / weights.mean()
+        weights = torch.clamp(weights, min=0.3, max=5.0)
         
         self.logger.info(f"Class weights - min: {weights.min():.3f}, max: {weights.max():.3f}, mean: {weights.mean():.3f}")
         
         return weights
     
     def create_model(self):
-        """Create the attention-fusion baseline model (ResNet34 + BERT)."""
+        """Create the attention-fusion baseline model with MATCHED parameters."""
         model = BaselineVQAModel(
             num_classes=self.num_answers,
             visual_feature_dim=512,
             text_feature_dim=768,
-            fusion_hidden_dim=512,
-            num_attention_heads=4,
-            dropout=0.3,
+            fusion_hidden_dim=self.fusion_hidden_dim,  # Now 384
+            num_attention_heads=self.num_attention_heads,  # Now 6
+            dropout=self.dropout,  # Now 0.35
             freeze_vision_encoder=False,
             freeze_text_encoder=False
         )
         return model
     
     def initialize_model(self, train_loader):
-        """Initialize model with all improvements."""
-        self.logger.info(f"Initializing model on device: {self.device}")
+        """Initialize model with MATCHED improvements."""
+        self.logger.info("=" * 80)
+        self.logger.info("BASELINE TRAINING (MATCHED TO LIGHTWEIGHT)")
+        self.logger.info("=" * 80)
+        self.logger.info(f"Device: {self.device}")
+        self.logger.info(f"Architecture: ResNet34 + BERT + Attention Fusion")
+        self.logger.info("=" * 80)
         
-        # Create attention-fusion baseline model
+        # Create model
         self.model = self.create_model()
         self.model = self.model.to(self.device)
         
         print_model_summary(self.model)
         
         # Calculate class weights
-        if self.use_class_weights:
-            self.class_weights = self.calculate_class_weights(train_loader)
-            self.class_weights = self.class_weights.to(self.device)
+        self.class_weights = self.calculate_class_weights(train_loader)
+        self.class_weights = self.class_weights.to(self.device)
         
-        # Better optimizer
+        # MATCHED optimizer
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.learning_rate,
             betas=(0.9, 0.999),
-            weight_decay=0.01,
+            weight_decay=self.weight_decay,  # Now 0.007
             eps=1e-8
         )
         
-        # Cosine annealing with warm restarts
-        self.scheduler = CosineAnnealingWarmRestarts(
+        # MATCHED scheduler: ReduceLROnPlateau instead of CosineAnnealingWarmRestarts
+        self.scheduler = ReduceLROnPlateau(
             self.optimizer,
-            T_0=5,  # Restart every 5 epochs
-            T_mult=2,
-            eta_min=1e-7
+            mode='max',
+            factor=0.5,
+            patience=4,
+            min_lr=1e-7
         )
         
-        # Loss function
-        if self.use_focal_loss:
-            self.logger.info("Using Focal Loss")
-            self.criterion = FocalLoss(alpha=1.0, gamma=2.0)
-        elif self.use_class_weights:
-            self.logger.info("Using Weighted CrossEntropy")
-            self.criterion = nn.CrossEntropyLoss(
-                weight=self.class_weights,
-                label_smoothing=0.1
-            )
-        else:
-            self.logger.info("Using Standard CrossEntropy")
-            self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        # MATCHED loss function
+        self.criterion = ImprovedFocalLoss(
+            alpha=self.class_weights,
+            gamma=self.focal_gamma  # Now 2.5
+        )
         
-        self.logger.info(f"✅ Model initialized with {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        self.logger.info(f"✅ Model initialized - {trainable_params:,} trainable parameters")
     
-    def train_epoch(self, train_loader: DataLoader) -> tuple:
+    def train_epoch(self, train_loader: DataLoader, epoch: int) -> tuple:
         """Train for one epoch."""
         self.model.train()
         total_loss = 0
         correct = 0
         total = 0
         
-        progress_bar = tqdm(train_loader, desc='Training')
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch} Training')
         for batch in progress_bar:
             images = batch['image'].to(self.device)
             question_ids = batch['question']['input_ids'].to(self.device)
@@ -296,9 +332,12 @@ class UltimateVQATrainer:
                 'batch_size': self.batch_size,
                 'learning_rate': self.learning_rate,
                 'num_epochs': self.num_epochs,
-                'answer_vocab_size': self.num_answers,
-                'use_focal_loss': self.use_focal_loss,
-                'use_class_weights': self.use_class_weights
+                'architecture': 'baseline_attention_matched',
+                'fusion_hidden_dim': self.fusion_hidden_dim,
+                'num_attention_heads': self.num_attention_heads,
+                'dropout': self.dropout,
+                'focal_gamma': self.focal_gamma,
+                'weight_decay': self.weight_decay,
             }
         }
         
@@ -306,6 +345,9 @@ class UltimateVQATrainer:
             best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
             torch.save(checkpoint, best_path)
             self.logger.info(f"🌟 Saved BEST model (Val Acc: {val_acc:.2f}%)")
+        
+        latest_path = os.path.join(self.checkpoint_dir, 'latest_model.pt')
+        torch.save(checkpoint, latest_path)
     
     def plot_training_history(self):
         """Plot training curves."""
@@ -348,7 +390,7 @@ class UltimateVQATrainer:
         axes[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plot_path = os.path.join(self.checkpoint_dir, 'training_curves_baseline.png')
+        plot_path = os.path.join(self.checkpoint_dir, 'training_curves_matched.png')
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -358,15 +400,8 @@ class UltimateVQATrainer:
         """Train the model."""
         start_time = datetime.now()
         
-        self.logger.info("=" * 80)
-        self.logger.info("BASELINE TRAINING")
-        self.logger.info("=" * 80)
-        self.logger.info(f"Device: {self.device}")
-        self.logger.info(f"Epochs: {self.num_epochs}")
-        self.logger.info(f"Batch size: {self.batch_size}")
-        self.logger.info(f"Learning rate: {self.learning_rate}")
-        self.logger.info(f"Focal Loss: {self.use_focal_loss}")
-        self.logger.info(f"Class Weights: {self.use_class_weights}")
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("MATCHED BASELINE TRAINING START")
         self.logger.info("=" * 80)
         
         for epoch in range(1, self.num_epochs + 1):
@@ -375,7 +410,7 @@ class UltimateVQATrainer:
             self.logger.info(f"{'='*80}")
             
             # Training
-            train_loss, train_acc = self.train_epoch(train_loader)
+            train_loss, train_acc = self.train_epoch(train_loader, epoch)
             self.logger.info(f"✓ Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
             
             # Validation
@@ -383,7 +418,7 @@ class UltimateVQATrainer:
             self.logger.info(f"✓ Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
             
             # Update learning rate
-            self.scheduler.step()
+            self.scheduler.step(val_acc)  # CHANGED: Now based on val_acc
             current_lr = self.optimizer.param_groups[0]['lr']
             self.logger.info(f"📉 Learning rate: {current_lr:.2e}")
             
@@ -400,6 +435,13 @@ class UltimateVQATrainer:
                 self.best_val_acc = val_acc
                 self.best_val_loss = val_loss
                 self.save_checkpoint(epoch, val_loss, val_acc, is_best=True)
+            else:
+                self.save_checkpoint(epoch, val_loss, val_acc, is_best=False)
+            
+            # Early stopping
+            if self.early_stopping(val_acc):
+                self.logger.info(f"\n⚠️ Early stopping at epoch {epoch}")
+                break
         
         # Training completed
         duration = (datetime.now() - start_time).total_seconds()
@@ -412,51 +454,38 @@ class UltimateVQATrainer:
         self.logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
         
         self.plot_training_history()
-        
-        # Save final model
-        final_checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'history': self.history,
-            'config': {
-                'num_answers': self.num_answers,
-                'batch_size': self.batch_size,
-                'learning_rate': self.learning_rate,
-                'num_epochs': self.num_epochs,
-                'answer_vocab_size': self.num_answers
-            }
-        }
-        final_path = os.path.join(self.checkpoint_dir, 'final_model.pt')
-        torch.save(final_checkpoint, final_path)
-        self.logger.info(f"💾 Final model saved to {final_path}")
 
 
 def main():
-    """Main training with all improvements."""
+    """Main training with MATCHED parameters."""
     
+    # MATCHED parameters to lightweight
     params = {
         'batch_size': 24,
         'learning_rate': 1e-4,
-        'num_epochs': 15,
-        'max_samples': None,
-        'max_answer_vocab_size': 120,  # Further reduced
-        'use_focal_loss': True,
-        'use_class_weights': False,  # Don't use both together
+        'num_epochs': 30,  # CHANGED from 15
+        'max_answer_vocab_size': 120,
+        'fusion_hidden_dim': 384,  # CHANGED from 512
+        'num_attention_heads': 6,  # CHANGED from 4
+        'dropout': 0.35,  # CHANGED from 0.3
+        'focal_gamma': 2.5,  # CHANGED from 2.0
+        'weight_decay': 0.007,  # CHANGED from 0.01
+        'early_stopping_patience': 10  # NEW
     }
     
     print("=" * 80)
-    print("BASELINE TRAINING CONFIGURATION")
+    print("MATCHED BASELINE TRAINING CONFIGURATION")
+    print("(Parameters matched to lightweight model for fair comparison)")
     print("=" * 80)
     for key, value in params.items():
         print(f"{key}: {value}")
     print("=" * 80)
     
     # Load data
-    print("\nLoading data...")
+    print("\n📦 Loading data...")
     train_loader, val_loader, test_loader, answer_vocab, _ = create_combined_data_loaders(
         batch_size=params['batch_size'],
-        max_samples=params['max_samples'],
+        max_samples=None,
         num_workers=0,
         max_answer_vocab_size=params['max_answer_vocab_size']
     )
@@ -467,13 +496,9 @@ def main():
     print(f"✓ Validation batches: {len(val_loader)}")
     
     # Initialize trainer
-    trainer = UltimateVQATrainer(
+    trainer = MatchedBaselineTrainer(
         num_answers=num_answers,
-        batch_size=params['batch_size'],
-        learning_rate=params['learning_rate'],
-        num_epochs=params['num_epochs'],
-        use_focal_loss=params['use_focal_loss'],
-        use_class_weights=params['use_class_weights']
+        **{k: v for k, v in params.items() if k not in ['max_answer_vocab_size']}
     )
     
     # Initialize model
@@ -485,7 +510,8 @@ def main():
     print("\n" + "=" * 80)
     print("🎉 TRAINING COMPLETE!")
     print("=" * 80)
-    print("\nRun: python evaluate_saved_model.py")
+    print("\nEvaluate with:")
+    print("  python evaluate_with_roc.py --checkpoint checkpoints/baseline_matched/best_model.pt")
     print("=" * 80)
 
 
